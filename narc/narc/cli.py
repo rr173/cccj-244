@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from .catalog import CatalogError, build_catalog, verify_identity
 from .format import STATUS_VALUE
 from .query import query_window
+from .release import ReleaseError, release_archive
 
 
 def _cmd_catalog(args: argparse.Namespace) -> int:
@@ -63,6 +65,20 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_release(args: argparse.Namespace) -> int:
+    manifest = release_archive(
+        args.archive, args.authorization, args.delivery
+    )
+    summary = {
+        "delivery": args.delivery,
+        "parts": len(manifest["parts"]),
+        "total_bytes": sum(entry["bytes"] for entry in manifest["parts"]),
+        "manifest": os.path.join(args.delivery, "parts.json"),
+    }
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="narc",
@@ -99,6 +115,20 @@ def build_parser() -> argparse.ArgumentParser:
     verify_cmd.add_argument("catalog")
     verify_cmd.add_argument("archive", nargs="?")
     verify_cmd.set_defaults(func=_cmd_verify)
+
+    release_cmd = sub.add_parser(
+        "release",
+        help="publish an authorized offline release into a new directory",
+    )
+    release_cmd.add_argument("archive", help="the frozen v1 source archive")
+    release_cmd.add_argument(
+        "authorization", help="JSON authorization slip"
+    )
+    release_cmd.add_argument(
+        "delivery",
+        help="delivery directory to create (must not exist yet)",
+    )
+    release_cmd.set_defaults(func=_cmd_release)
     return parser
 
 
@@ -107,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (CatalogError, OSError, ValueError) as exc:
+    except (CatalogError, ReleaseError, OSError, ValueError) as exc:
         print(f"narc: error: {exc}", file=sys.stderr)
         return 2
 
