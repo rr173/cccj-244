@@ -1,4 +1,4 @@
-"""Command line interface: catalog / query / verify."""
+"""Command line interface: catalog / query / verify / release / gap / reconcile."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from .format import STATUS_VALUE
 from .gap_ledger import apply_batch, init_ledger
 from .gap_model import GapError
 from .query import query_window
+from .reconcile import ReconcileError, reconcile_archives
 from .release import ReleaseError, release_archive
 
 
@@ -93,6 +94,12 @@ def _cmd_gap_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    summary = reconcile_archives(args.alignment, args.differences)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="narc",
@@ -159,6 +166,17 @@ def build_parser() -> argparse.ArgumentParser:
     gap_apply.add_argument("workspace", help="directory holding the ledger")
     gap_apply.add_argument("batch", help="JSON batch to apply")
     gap_apply.set_defaults(func=_cmd_gap_apply)
+
+    reconcile_cmd = sub.add_parser(
+        "reconcile",
+        help="reconcile two aligned archives into a JSONL differences sheet",
+    )
+    reconcile_cmd.add_argument("alignment", help="JSON alignment sheet")
+    reconcile_cmd.add_argument(
+        "differences",
+        help="differences sheet to create (must not exist yet)",
+    )
+    reconcile_cmd.set_defaults(func=_cmd_reconcile)
     return parser
 
 
@@ -167,7 +185,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (CatalogError, ReleaseError, GapError, OSError, ValueError) as exc:
+    except (CatalogError, ReleaseError, GapError, ReconcileError,
+            OSError, ValueError) as exc:
         print(f"narc: error: {exc}", file=sys.stderr)
         return 2
 

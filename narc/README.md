@@ -14,6 +14,8 @@
   绝对值之后的后缀可读；
 - 离线发布（`release`）把获准样点重打包成一批可独立解码的 v1 分件，原档、原
   来源名与解码垫用的私有前值都不外发。
+- 离线对账（`reconcile`）把同一次观测的主录/备录两份归档按对齐单映射到逻辑
+  样点键，输出需要复核的差异单，每条极值都带可回到原档定位的样点坐标。
 
 ## 目录
 
@@ -24,18 +26,21 @@ narc/
   catalog.py    全量编目、结构校验、来源身份绑定
   query.py      窄窗查询与重建状态机
   release.py    离线发布：授权单校验、合规分件规划与原子交付
+  reconcile.py  离线对账：对齐单校验、流式双档合并与差异单原子交付
   gap_model.py  补采计划/批次校验与来源齐采扫描
   gap_ledger.py 本地补采台账：SQLite 事务、区间增量与变化单
   writer.py     仅用于构造样例/测试的归档写入器
-  cli.py        catalog / query / verify / release / gap-init / gap-apply
+  cli.py        catalog / query / verify / release / reconcile / gap-init / gap-apply
 narc_tool.py    支持 python3 -I 的顶层入口
 examples/
   release/      可复跑的离线发布小样例（构造源档→发布→逐件独立解码）
+  reconcile/    可复跑的离线对账小样例（主录/备录→对齐→差异单）
   gap/          可复跑的补采台账小样例（迟到收档→替换→撤回→变化单）
 tests/
   reference.py  独立实现的全量参考解码器
   test_narc.py  差分、错误类别、长链、边界与字节审计测试
   test_release.py 发布语义、拒绝规则、规划最优性与 O(N log N) 测试
+  test_reconcile.py 对账语义、对齐单校验、原子交付与随机差分测试
   test_gap.py   补采台账：重试契约、原子批次、齐采语义与增量范围
 ```
 
@@ -47,6 +52,7 @@ python3 -I narc_tool.py query    <catalog.json> --start 100 --end 110 \
                                  --columns 1,2 [--full-verify] [--format json]
 python3 -I narc_tool.py verify   <catalog.json> [archive.narc]
 python3 -I narc_tool.py release  <archive.narc> <authorization.json> <delivery/>
+python3 -I narc_tool.py reconcile <alignment.json> <differences.jsonl>
 python3 -I narc_tool.py gap-init <workspace> <plan.json>
 python3 -I narc_tool.py gap-apply <workspace> <batch.json>
 ```
@@ -57,7 +63,7 @@ python3 -I narc_tool.py gap-apply <workspace> <batch.json>
 ## 库接口
 
 ```python
-from narc import build_catalog, query_window, release_archive
+from narc import build_catalog, query_window, release_archive, reconcile_archives
 
 build_catalog("feed.narc", "feed.json")
 result = query_window("feed.json", start_row=1000, end_row=1008, columns=[1, 4])
@@ -67,6 +73,9 @@ print(result.bytes_read, [(s.offset, s.end) for s in result.spans])
 
 # 离线发布：返回 parts.json 的内容，并把分件原子写入新目录。
 manifest = release_archive("feed.narc", "authorization.json", "delivery/")
+
+# 离线对账：把差异单原子写入一个新文件，返回简要统计。
+summary = reconcile_archives("alignment.json", "differences.jsonl")
 ```
 
 ## 离线发布（release）
@@ -126,6 +135,76 @@ bash examples/release/run_example.sh
 
 脚本会构造源档与授权单、执行发布，再对每个分件单独 `catalog` / `query`，验证
 它们脱离彼此即可解码，并确认原来源名不出现在任何交付字节中。
+
+## 离线对账（reconcile）
+
+同一次观测有主录和备录两份归档。设备重启后片段的起始编号可能重新计数，通道
+也可能换列；按原行号做差会对错样点，直接取第一条又会掩盖同一份归档内部的
+矛盾。`reconcile` 按一份**对齐单**把两侧归档映射到逻辑样点键
+`(channel, sample)`，输出需要值班员复核的**差异单**（JSONL），每条极值都带
+可以回到任一原档定位的样点坐标。
+
+### 对齐单
+
+```json
+{
+  "left":  {"archive": "/data/primary.narc", "segments": [
+    {"fragment_id": 7, "column_id": 1, "local": [5000, 5012],
+     "channel": "temp", "global_start": 9000}
+  ]},
+  "right": {"archive": "/data/backup.narc", "segments": [
+    {"fragment_id": 2, "column_id": 3, "local": [0, 12],
+     "channel": "temp", "global_start": 9000}
+  ]}
+}
+```
+
+- `left` / `right` 各含一个本地不可变 v1 归档的绝对路径 `archive` 和非空
+  `segments`；
+- 每段用 `fragment_id`、`column_id`、两端为整数的半开区间 `local: [start,end]`、
+  非空字符串 `channel` 和整数 `global_start` 指定对应关系：原样点 `row` 对应
+  逻辑键 `(channel, global_start + row - start)`；
+- 片段必须存在于归档中，`local` 非空并落在片段声明范围内；编号与映射后的半开
+  区间端点都必须在 v1 无符号字段范围内（编号 uint16，样点坐标 uint32）；
+- 同侧同片段同列的原区间不能相交（同一个原样点不能在一侧被映射两次）；逻辑
+  区间可以自由相交——相交表示这些片段或列对同一样点有多份观测；
+- 没有块覆盖的列或位置不凭空产生值，不做插值，也不做单位换算。
+
+### 观测与出单语义
+
+- 值按 v1 重建后的**精确整数**比较，不按原始增量或浮点数比较；显式缺测、无
+  覆盖、坏块和缺可信前值（`missing_prefix`）的记录都不算观测；
+- 对齐区间之外的记录不进入差异单，但仍可能是区间内增量的可信前置（同块更早
+  的绝对值、依赖链上的入口值），解码按 v1 规则照常使用它们；可隔离的坏块整体
+  没有可信观测，其依赖后缀仍按 v1 的绝对值恢复规则处理；
+- 两侧均无可信值，或两侧各只有一种可信值且相等，不出单；同侧重复出现同一个
+  值不算矛盾；
+- 其余每个逻辑键写一行：`channel`、`sample`、`kind`、`left`、`right`。任一侧
+  有两种或以上可信值时记 `ambiguous`（即使另一侧有相同的值集合），否则按情况
+  记 `left_only`、`right_only` 或 `different`；
+- 每侧无值用 `null`，有值则为 `{"min": …, "max": …}`；每条极值记录含
+  `value`、`fragment_id`、`column_id`、`row`，同值出处有多个时取后三个字段组成
+  的元组最小者——凭这三个字段即可回到该侧原档定位样点；
+- 出单按通道名的 Unicode 码点顺序、再按样点号升序排列；映射段在对齐单里的
+  先后不影响结果。
+
+### 资源与交付保证
+
+- 配置（对齐单）和每份归档的块头索引可驻留内存；观测解码按定长切片流式进行，
+  每个通道的合并只驻留每映射段一项、每个逻辑键每侧一份聚合，差异单流式写出——
+  工作内存不随单块载荷、观测总量或差异条数增长，耗时也不随空坐标跨度增长；
+- 输出路径必须不存在；差异单先写入目标旁的隐藏临时目录，全部落盘后以不可
+  覆盖的方式提交，输入无效、归档结构无法解释或读写出错时不会留下正式差异单。
+
+### 可复跑样例
+
+```bash
+bash examples/reconcile/run_example.sh
+```
+
+脚本构造主录/备录两份归档（重启后片段重新计数、通道换列、备录对同一通道有
+两份采集、主录含一个坏块），按对齐单对账并打印差异单；随后验证映射段顺序
+不影响结果，以及已存在的输出路径会被拒绝。
 
 ## 补采台账（gap）
 
@@ -220,6 +299,7 @@ bash examples/gap/run_example.sh
 ```bash
 python3 -I tests/test_narc.py
 python3 -I tests/test_release.py
+python3 -I tests/test_reconcile.py
 python3 -I tests/test_gap.py
 ```
 
@@ -240,6 +320,13 @@ python3 -I tests/test_gap.py
 解码（含块中途切分与依赖块私有前值恢复）、坏块与缺可信前置整单拒绝、int64
 超限精确值保留、对 `60` 组随机用例用暴力 DP 核对“最少件数 + 字典序最大终点”
 规划、授权单校验、原子交付与泄漏检查，以及数亿行空档下规划不随行数增长。
+
+`test_reconcile.py` 包含：四种差异类型与免出单情形、缺测/无覆盖/坏块/缺前置
+均非观测、区间外可信前置（同块绝对值与跨块依赖链）照常解析增量、坏块隔离与
+依赖后缀按 v1 恢复、同侧多值 `ambiguous` 与同值重复免报、极值出处元组最小者
+tie-break、通道码点序与样点升序、映射段顺序不变性、对齐单结构/坐标范围/同侧
+相交校验、输出路径已存在与不可编目归档时不留正式差异单、小切片解码超大块与
+int64 超限精确比较，以及 `60` 组随机含依赖链和损坏块的双档与参考对账器差分。
 
 `test_gap.py` 包含：空台账全区间待补采、显式缺测/损坏块/缺前置的齐采判定、
 坏副本不抵消齐采副本、跨来源列不拼帧、同批撤回+补上不产生工单、旧归档下线后

@@ -6,6 +6,7 @@ from .gap_ledger import init_ledger as gap_init_ledger
 from .gap_ledger import pending_intervals as gap_pending_intervals
 from .gap_model import GapError
 from .query import Cell, QueryResult, query_window
+from .reconcile import ReconcileError, reconcile_archives
 from .release import (
     Authorization,
     ReleaseError,
@@ -28,4 +29,6 @@ __all__ = [
     "gap_apply_batch",
     "gap_pending_intervals",
     "GapError",
+    "reconcile_archives",
+    "ReconcileError",
 ]
