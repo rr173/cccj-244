@@ -9,6 +9,8 @@ import sys
 
 from .catalog import CatalogError, build_catalog, verify_identity
 from .format import STATUS_VALUE
+from .gap_ledger import apply_batch, init_ledger
+from .gap_model import GapError
 from .query import query_window
 from .release import ReleaseError, release_archive
 
@@ -79,6 +81,18 @@ def _cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gap_init(args: argparse.Namespace) -> int:
+    init_ledger(args.workspace, args.plan)
+    return 0
+
+
+def _cmd_gap_apply(args: argparse.Namespace) -> int:
+    slip_bytes = apply_batch(args.workspace, args.batch)
+    sys.stdout.buffer.write(slip_bytes)
+    sys.stdout.buffer.flush()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="narc",
@@ -129,6 +143,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="delivery directory to create (must not exist yet)",
     )
     release_cmd.set_defaults(func=_cmd_release)
+
+    gap_init = sub.add_parser(
+        "gap-init",
+        help="create a local gap-recovery ledger for a sampling plan",
+    )
+    gap_init.add_argument("workspace", help="directory that will hold the ledger")
+    gap_init.add_argument("plan", help="JSON sampling plan")
+    gap_init.set_defaults(func=_cmd_gap_init)
+
+    gap_apply = sub.add_parser(
+        "gap-apply",
+        help="apply one batch to the ledger and print its change slip",
+    )
+    gap_apply.add_argument("workspace", help="directory holding the ledger")
+    gap_apply.add_argument("batch", help="JSON batch to apply")
+    gap_apply.set_defaults(func=_cmd_gap_apply)
     return parser
 
 
@@ -137,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (CatalogError, ReleaseError, OSError, ValueError) as exc:
+    except (CatalogError, ReleaseError, GapError, OSError, ValueError) as exc:
         print(f"narc: error: {exc}", file=sys.stderr)
         return 2
 

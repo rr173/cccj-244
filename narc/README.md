@@ -24,15 +24,19 @@ narc/
   catalog.py    全量编目、结构校验、来源身份绑定
   query.py      窄窗查询与重建状态机
   release.py    离线发布：授权单校验、合规分件规划与原子交付
+  gap_model.py  补采计划/批次校验与来源齐采扫描
+  gap_ledger.py 本地补采台账：SQLite 事务、区间增量与变化单
   writer.py     仅用于构造样例/测试的归档写入器
-  cli.py        catalog / query / verify / release 命令
+  cli.py        catalog / query / verify / release / gap-init / gap-apply
 narc_tool.py    支持 python3 -I 的顶层入口
 examples/
   release/      可复跑的离线发布小样例（构造源档→发布→逐件独立解码）
+  gap/          可复跑的补采台账小样例（迟到收档→替换→撤回→变化单）
 tests/
   reference.py  独立实现的全量参考解码器
   test_narc.py  差分、错误类别、长链、边界与字节审计测试
   test_release.py 发布语义、拒绝规则、规划最优性与 O(N log N) 测试
+  test_gap.py   补采台账：重试契约、原子批次、齐采语义与增量范围
 ```
 
 ## 命令行
@@ -43,6 +47,8 @@ python3 -I narc_tool.py query    <catalog.json> --start 100 --end 110 \
                                  --columns 1,2 [--full-verify] [--format json]
 python3 -I narc_tool.py verify   <catalog.json> [archive.narc]
 python3 -I narc_tool.py release  <archive.narc> <authorization.json> <delivery/>
+python3 -I narc_tool.py gap-init <workspace> <plan.json>
+python3 -I narc_tool.py gap-apply <workspace> <batch.json>
 ```
 
 查询输出末尾给出 `bytes_read`、物理读区间 `spans` 和触达的块标识，可直接用于
@@ -121,11 +127,100 @@ bash examples/release/run_example.sh
 脚本会构造源档与授权单、执行发布，再对每个分件单独 `catalog` / `query`，验证
 它们脱离彼此即可解码，并确认原来源名不出现在任何交付字节中。
 
+## 补采台账（gap）
+
+仪器值班员按计划补采时，一轮交班可能同时收到迟到的归档、替换掉错误副本、
+撤回一批误报。`gap-init` / `gap-apply` 在本地维护一份补采台账，每批收档只
+交付**一张变化单**：哪些样点现在要补采（`opened`），哪些原定补采的样点可以
+关单（`resolved`）。台账不导出原始样点，也不修改收来的档案。
+
+### 计划
+
+```json
+{"range": [0, 1000000], "columns": [1, 4]}
+```
+
+- `range`：半开样点区间 `[start, end)`，非空且落在 v1 坐标范围内；
+- `columns`：v1 列编号，非空、无重复。
+
+空台账中整个计划区间都待补采。
+
+### 批次
+
+```json
+{
+  "revision": 7,
+  "changes": [
+    {"source_id": "probe-a", "op": "upsert",
+     "archive": "/data/probe-a.narc", "fragment_id": 3},
+    {"source_id": "probe-b", "op": "remove"}
+  ]
+}
+```
+
+- `revision`：从 1 开始连续递增的整数；
+- `changes`：非空；同一批不能对同一 `source_id` 做两次操作；
+- `upsert`：`archive` 是不可变 v1 归档的绝对路径，`fragment_id` 指定归档内
+  一个片段；新增来源或**整体替换**该来源，替换不依赖旧文件；
+- `remove`：撤回一个已登记来源，不需要而且不会读取旧归档。同一存档可以登记
+  到多个来源名下，各来源分别撤回。
+
+所选片段的样点坐标已经对齐到计划，不做重采样。
+
+### 齐采语义
+
+一个位置只有在**至少一个当前来源的指定片段**中，所有必采列均能读出可信值，
+才算齐采。不能拿不同来源的列拼成一帧。显式缺测、无覆盖、损坏块和缺前置
+（`missing_prefix`）都不算值；一个坏副本也不能抵消另一个齐采副本。解码完全
+沿用 v1 语义：可信绝对值恢复后的有效行照常参与齐采，不因依赖链长而误判。
+
+无法编目的归档或不存在的 `fragment_id` 使整批失败；能编目但标记为损坏的块
+按上面的齐采规则处理。`remove` 不存在的来源同样使整批失败。
+
+### 变化单
+
+成功时把 JSON 写到标准输出：
+
+```json
+{"revision": 7, "opened": [[12, 20]], "resolved": [[30, 44], [50, 51]]}
+```
+
+`opened` 是本批前齐采、应用整批后待补采的样点；`resolved` 正好相反。两组
+都按起点升序、合并相邻的半开区间，只在计划范围内计算；无对应变化时为空
+列表。变化按**整批前后**比较，所以同一批里一个来源撤回、另一个补上不会产生
+先开后关的工单。
+
+### 原子性与重试
+
+台账和该批变化单在同一个 SQLite 事务中提交。非法输入、读写失败或进程在提交
+前中断，重开台账都看不到半批。提交完成后若调用者没收到变化单，用**内容逐字节
+相同**的 JSON 重试当前最新版本会返回原变化单，且不重新访问任何档案；当前版本
+号相同但内容不同、跳号或提交更早的版本都拒绝。允许单机单写，不要求多机协调。
+
+### 增量范围
+
+历史原档处理后可能下线：增量只读取本批 `upsert` 指定的输入，替换或撤回都不
+依赖旧文件。计划可能横跨数亿行，空档以事件区间表示，绝不逐行展开。台账按
+来源保存各自齐采区间，并把计划切成带“齐采来源计数”的极大区间；处理一批时
+只改动本批变动来源的**新旧齐采差异范围**，在这段范围内按区间查其它来源，而
+不遍历整份历史来源或不相交的历史范围。
+
+### 可复跑样例
+
+```bash
+bash examples/gap/run_example.sh
+```
+
+脚本构造计划、两批归档和一轮误报，演示迟到收档、替换错误副本、同一存档双
+来源登记、撤回重复来源（不产生工单）以及最终撤回导致的重新开工；最后在归档
+已下线的情况下做逐字节重试，并确认冲突/跳号/更早的版本都被拒绝。
+
 ## 测试
 
 ```bash
 python3 -I tests/test_narc.py
 python3 -I tests/test_release.py
+python3 -I tests/test_gap.py
 ```
 
 `test_narc.py` 包含：
@@ -145,6 +240,12 @@ python3 -I tests/test_release.py
 解码（含块中途切分与依赖块私有前值恢复）、坏块与缺可信前置整单拒绝、int64
 超限精确值保留、对 `60` 组随机用例用暴力 DP 核对“最少件数 + 字典序最大终点”
 规划、授权单校验、原子交付与泄漏检查，以及数亿行空档下规划不随行数增长。
+
+`test_gap.py` 包含：空台账全区间待补采、显式缺测/损坏块/缺前置的齐采判定、
+坏副本不抵消齐采副本、跨来源列不拼帧、同批撤回+补上不产生工单、旧归档下线后
+仍可替换与撤回、逐字节重试不访问档案、版本冲突/跳号/更早版本拒绝、非法输入
+与不可编目档案不留半批、中断后重开台账只见整批、数亿行空档的事件化处理，以及
+`120` 组随机含依赖链和损坏块的档案与参考解码器的齐采区间差分。
 
 ## 设计取舍
 
